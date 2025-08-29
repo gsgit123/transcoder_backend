@@ -47,6 +47,8 @@ app.post('/transcode', async (req, res) => {
 
     const localRawPath = path.join(tempRawDir, videoData.raw_path);
     const localHlsPlaylistPath = path.join(tempHlsDir, 'playlist.m3u8');
+    const localThumbnailPath = path.join(tempOutputDir, 'thumbnail.png');
+    const thumbnailFileName = `${videoId}.png`;
 
     // Step 2: Download the raw video file from Supabase Storage
     console.log(`Downloading raw file: ${videoData.raw_path}`);
@@ -57,6 +59,21 @@ app.post('/transcode', async (req, res) => {
     if (downloadError) throw downloadError;
     fs.writeFileSync(localRawPath, Buffer.from(await fileData.arrayBuffer()));
     console.log(`Downloaded to: ${localRawPath}`);
+
+
+    console.log('Generating thumbnail...');
+    await new Promise((resolve, reject) => {
+      ffmpeg(localRawPath)
+        .screenshots({
+          timestamps: ['00:00:02'], // Take thumbnail at the 2-second mark
+          filename: 'thumbnail.png',
+          folder: tempOutputDir,
+          size: '640x360'
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
+    console.log('Thumbnail generated.');
 
     // Step 3: Run FFMPEG to transcode the video to HLS
     console.log(`Starting transcoding for video: ${videoId}`);
@@ -74,6 +91,14 @@ app.post('/transcode', async (req, res) => {
         .run();
     });
     console.log('Transcoding finished.');
+
+
+    const thumbnailBuffer = fs.readFileSync(localThumbnailPath);
+    console.log(`Uploading thumbnail: ${thumbnailFileName}`);
+    const { error: thumbUploadError } = await supabaseAdmin.storage
+        .from('thumbnails')
+        .upload(thumbnailFileName, thumbnailBuffer, { contentType: 'image/png' });
+    if (thumbUploadError) throw thumbUploadError;
 
     // Step 4: Upload the HLS files to Supabase Storage
     const hlsFiles = fs.readdirSync(tempHlsDir);
@@ -97,7 +122,8 @@ app.post('/transcode', async (req, res) => {
       .from('videos')
       .update({
         status: 'ready',
-        hls_path: `${videoId}/playlist.m3u8`
+        hls_path: `${videoId}/playlist.m3u8`,
+        thumbnail_path: thumbnailFileName
       })
       .eq('id', videoId);
 
