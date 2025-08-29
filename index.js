@@ -41,13 +41,13 @@ app.post('/transcode', async (req, res) => {
 
     // Create temporary local directories for processing
     const tempRawDir = path.join(__dirname, 'temp_raw');
-    const tempHlsDir = path.join(__dirname, 'temp_hls');
+    const tempHlsDir = path.join(__dirname, 'temp_hls'); // Correct directory name
     fs.mkdirSync(tempRawDir, { recursive: true });
     fs.mkdirSync(tempHlsDir, { recursive: true });
 
     const localRawPath = path.join(tempRawDir, videoData.raw_path);
     const localHlsPlaylistPath = path.join(tempHlsDir, 'playlist.m3u8');
-    const localThumbnailPath = path.join(tempOutputDir, 'thumbnail.png');
+    const localThumbnailPath = path.join(tempHlsDir, 'thumbnail.png'); // Bug Fixed Here
     const thumbnailFileName = `${videoId}.png`;
 
     // Step 2: Download the raw video file from Supabase Storage
@@ -67,7 +67,7 @@ app.post('/transcode', async (req, res) => {
         .screenshots({
           timestamps: ['00:00:02'], // Take thumbnail at the 2-second mark
           filename: 'thumbnail.png',
-          folder: tempOutputDir,
+          folder: tempHlsDir, // Bug Fixed Here
           size: '640x360'
         })
         .on('end', resolve)
