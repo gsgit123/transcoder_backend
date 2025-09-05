@@ -22,7 +22,6 @@ app.post('/transcode', async (req, res) => {
     return res.status(400).send({ error: 'videoId is required' });
   }
 
-  // Acknowledge the request immediately
   res.status(202).send({ message: `Accepted. Processing video: ${videoId}` });
 
   // --- Start the long-running process in the background ---
@@ -42,7 +41,6 @@ app.post('/transcode', async (req, res) => {
     fs.mkdirSync(tempRawDir, { recursive: true });
     fs.mkdirSync(tempOutputDir, { recursive: true });
     
-    // Create subdirectories for each resolution
     fs.mkdirSync(path.join(tempOutputDir, '720p'), { recursive: true });
     fs.mkdirSync(path.join(tempOutputDir, '480p'), { recursive: true });
     fs.mkdirSync(path.join(tempOutputDir, '240p'), { recursive: true });
@@ -75,26 +73,28 @@ app.post('/transcode', async (req, res) => {
     });
     console.log('Thumbnail generated.');
 
-    // --- UPDATED: Run FFMPEG to transcode to 720p, 480p, and 240p ---
+    // --- CORRECTED: FFMPEG command with separate options ---
     console.log('Starting Adaptive Bitrate (ABR) transcoding...');
     await new Promise((resolve, reject) => {
       ffmpeg(localRawPath)
         .outputOptions([
-          // Define stream mappings and codecs
-          '-map 0:v:0 -map 0:a:0 -map 0:v:0 -map 0:a:0 -map 0:v:0 -map 0:a:0',
+          // Define stream mappings - each option is a separate string
+          '-map', '0:v:0', '-map', '0:a:0',
+          '-map', '0:v:0', '-map', '0:a:0',
+          '-map', '0:v:0', '-map', '0:a:0',
           
           // Filter to create three scaled video outputs
-          '-filter:v:0 scale=-2:720', '-c:v:0 libx264', '-b:v:0 2000k', // 720p stream
-          '-filter:v:1 scale=-2:480', '-c:v:1 libx264', '-b:v:1 800k',  // 480p stream
-          '-filter:v:2 scale=-2:240', '-c:v:2 libx264', '-b:v:2 400k',  // 240p stream
-          '-c:a aac', '-b:a 128k', // Audio codec for all streams
+          '-filter:v:0', 'scale=-2:720', '-c:v:0', 'libx264', '-b:v:0', '2000k',
+          '-filter:v:1', 'scale=-2:480', '-c:v:1', 'libx264', '-b:v:1', '800k',
+          '-filter:v:2', 'scale=-2:240', '-c:v:2', 'libx264', '-b:v:2', '400k',
+          '-c:a', 'aac', '-b:a', '128k',
 
           // HLS options for ABR
-          '-f hls',
-          '-hls_time 10',
-          '-hls_playlist_type vod',
+          '-f', 'hls',
+          '-hls_time', '10',
+          '-hls_playlist_type', 'vod',
           '-hls_segment_filename', `${tempOutputDir}/%v/segment%03d.ts`,
-          '-master_pl_name playlist.m3u8',
+          '-master_pl_name', 'playlist.m3u8',
           '-var_stream_map', "v:0,a:0,name:720p v:1,a:1,name:480p v:2,a:2,name:240p"
         ])
         .output(`${tempOutputDir}/%v/playlist.m3u8`)
