@@ -8,6 +8,7 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Initialize the Supabase Admin Client
+// Ensure these environment variables are set in your Render dashboard
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
@@ -22,10 +23,12 @@ app.post('/transcode', async (req, res) => {
     return res.status(400).send({ error: 'videoId is required' });
   }
 
+  // Acknowledge the request immediately so the frontend doesn't time out
   res.status(202).send({ message: `Accepted. Processing video: ${videoId}` });
 
   // --- Start the long-running process in the background ---
   try {
+    // Step 1: Get video metadata from the database
     const { data: videoData, error: dbError } = await supabaseAdmin
       .from('videos')
       .select('raw_path')
@@ -36,36 +39,35 @@ app.post('/transcode', async (req, res) => {
       throw new Error(`Video not found in DB for ID: ${videoId}`);
     }
 
+    // Create temporary local directories for processing
     const tempRawDir = path.join(__dirname, 'temp_raw');
-    const tempOutputDir = path.join(__dirname, 'temp_output');
+    const tempHlsDir = path.join(__dirname, 'temp_hls'); // Correct directory name
     fs.mkdirSync(tempRawDir, { recursive: true });
-    fs.mkdirSync(tempOutputDir, { recursive: true });
-    
-    fs.mkdirSync(path.join(tempOutputDir, '720p'), { recursive: true });
-    fs.mkdirSync(path.join(tempOutputDir, '480p'), { recursive: true });
-    fs.mkdirSync(path.join(tempOutputDir, '240p'), { recursive: true });
+    fs.mkdirSync(tempHlsDir, { recursive: true });
 
     const localRawPath = path.join(tempRawDir, videoData.raw_path);
+    const localHlsPlaylistPath = path.join(tempHlsDir, 'playlist.m3u8');
+    const localThumbnailPath = path.join(tempHlsDir, 'thumbnail.png'); // Bug Fixed Here
     const thumbnailFileName = `${videoId}.png`;
-    const localThumbnailPath = path.join(tempOutputDir, 'thumbnail.png');
 
-    // Download raw file
+    // Step 2: Download the raw video file from Supabase Storage
     console.log(`Downloading raw file: ${videoData.raw_path}`);
     const { data: fileData, error: downloadError } = await supabaseAdmin.storage
       .from('raw_uploads')
       .download(videoData.raw_path);
+
     if (downloadError) throw downloadError;
     fs.writeFileSync(localRawPath, Buffer.from(await fileData.arrayBuffer()));
     console.log(`Downloaded to: ${localRawPath}`);
 
-    // Generate Thumbnail
+
     console.log('Generating thumbnail...');
     await new Promise((resolve, reject) => {
       ffmpeg(localRawPath)
         .screenshots({
-          timestamps: ['00:00:02'],
+          timestamps: ['00:00:02'], // Take thumbnail at the 2-second mark
           filename: 'thumbnail.png',
-          folder: tempOutputDir,
+          folder: tempHlsDir, // Bug Fixed Here
           size: '640x360'
         })
         .on('end', resolve)
@@ -73,62 +75,49 @@ app.post('/transcode', async (req, res) => {
     });
     console.log('Thumbnail generated.');
 
-    // --- CORRECTED: FFMPEG command with separate options ---
-    console.log('Starting Adaptive Bitrate (ABR) transcoding...');
+    // Step 3: Run FFMPEG to transcode the video to HLS
+    console.log(`Starting transcoding for video: ${videoId}`);
     await new Promise((resolve, reject) => {
       ffmpeg(localRawPath)
         .outputOptions([
-          // Define stream mappings - each option is a separate string
-          '-map', '0:v:0', '-map', '0:a:0',
-          '-map', '0:v:0', '-map', '0:a:0',
-          '-map', '0:v:0', '-map', '0:a:0',
-          
-          // Filter to create three scaled video outputs
-          '-filter:v:0', 'scale=-2:720', '-c:v:0', 'libx264', '-b:v:0', '2000k',
-          '-filter:v:1', 'scale=-2:480', '-c:v:1', 'libx264', '-b:v:1', '800k',
-          '-filter:v:2', 'scale=-2:240', '-c:v:2', 'libx264', '-b:v:2', '400k',
-          '-c:a', 'aac', '-b:a', '128k',
-
-          // HLS options for ABR
-          '-f', 'hls',
-          '-hls_time', '10',
-          '-hls_playlist_type', 'vod',
-          '-hls_segment_filename', `${tempOutputDir}/%v/segment%03d.ts`,
-          '-master_pl_name', 'playlist.m3u8',
-          '-var_stream_map', "v:0,a:0,name:720p v:1,a:1,name:480p v:2,a:2,name:240p"
+          '-c:v h264',       // Use the H.264 video codec
+          '-hls_time 10',     // Create 10-second video segments
+          '-hls_list_size 0', // Keep all segments in the playlist
+          '-f hls'            // The output format is HLS
         ])
-        .output(`${tempOutputDir}/%v/playlist.m3u8`)
-        .on('end', resolve)
-        .on('error', (err) => reject(new Error(err)))
+        .output(localHlsPlaylistPath)
+        .on('end', resolve) // Resolve the promise when transcoding is finished
+        .on('error', (err) => reject(new Error(err))) // Reject on error
         .run();
     });
-    console.log('ABR transcoding finished.');
+    console.log('Transcoding finished.');
 
-    // --- Upload HLS files and Thumbnail in Parallel ---
-    console.log('Starting parallel uploads...');
-    const filesToUpload = [];
-    filesToUpload.push({ name: 'playlist.m3u8', path: path.join(tempOutputDir, 'playlist.m3u8')});
-    fs.readdirSync(path.join(tempOutputDir, '720p')).forEach(f => filesToUpload.push({ name: `720p/${f}`, path: path.join(tempOutputDir, '720p', f)}));
-    fs.readdirSync(path.join(tempOutputDir, '480p')).forEach(f => filesToUpload.push({ name: `480p/${f}`, path: path.join(tempOutputDir, '480p', f)}));
-    fs.readdirSync(path.join(tempOutputDir, '240p')).forEach(f => filesToUpload.push({ name: `240p/${f}`, path: path.join(tempOutputDir, '240p', f)}));
 
-    const uploadPromises = filesToUpload.map(file => {
-      const fileBuffer = fs.readFileSync(file.path);
-      const contentType = file.name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
-      return supabaseAdmin.storage
-        .from('hls')
-        .upload(`${videoId}/${file.name}`, fileBuffer, { contentType, upsert: true });
-    });
-    
     const thumbnailBuffer = fs.readFileSync(localThumbnailPath);
-    uploadPromises.push(supabaseAdmin.storage.from('thumbnails').upload(thumbnailFileName, thumbnailBuffer, { contentType: 'image/png' }));
-    
-    const uploadResults = await Promise.all(uploadPromises);
-    const uploadError = uploadResults.find(result => result.error);
-    if (uploadError) throw uploadError.error;
-    console.log('All uploads complete.');
+    console.log(`Uploading thumbnail: ${thumbnailFileName}`);
+    const { error: thumbUploadError } = await supabaseAdmin.storage
+        .from('thumbnails')
+        .upload(thumbnailFileName, thumbnailBuffer, { contentType: 'image/png' });
+    if (thumbUploadError) throw thumbUploadError;
 
-    // Update the database record
+    // Step 4: Upload the HLS files to Supabase Storage
+    const hlsFiles = fs.readdirSync(tempHlsDir);
+    for (const file of hlsFiles) {
+      const filePath = path.join(tempHlsDir, file);
+      const fileBuffer = fs.readFileSync(filePath);
+      console.log(`Uploading HLS file: ${file}`);
+      const { error: uploadError } = await supabaseAdmin.storage
+        .from('hls') // Your HLS bucket
+        .upload(`${videoId}/${file}`, fileBuffer, {
+          // Set the correct content type for the files
+          contentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T',
+          upsert: true // Overwrite if files already exist
+        });
+      if (uploadError) throw uploadError;
+    }
+    console.log('HLS upload complete.');
+
+    // Step 5: Update the database record to 'ready'
     await supabaseAdmin
       .from('videos')
       .update({
@@ -142,13 +131,18 @@ app.post('/transcode', async (req, res) => {
 
   } catch (error) {
     console.error(`❌ Failed to process video ${videoId}:`, error);
+    // If anything fails, update the status to 'failed'
     await supabaseAdmin
       .from('videos')
       .update({ status: 'failed' })
       .eq('id', videoId);
+
   } finally {
-    fs.rmSync(path.join(__dirname, 'temp_raw'), { recursive: true, force: true });
-    fs.rmSync(path.join(__dirname, 'temp_output'), { recursive: true, force: true });
+    // Step 6: Cleanup - always delete the temporary local files
+    const tempRawDir = path.join(__dirname, 'temp_raw');
+    const tempHlsDir = path.join(__dirname, 'temp_hls');
+    fs.rmSync(tempRawDir, { recursive: true, force: true });
+    fs.rmSync(tempHlsDir, { recursive: true, force: true });
     console.log('Cleanup complete.');
   }
 });
