@@ -30,11 +30,20 @@ app.post('/transcode', async (req, res) => {
   const { videoId } = req.body;
   if (!videoId) return res.status(400).send({ error: 'videoId is required' });
 
-  // Respond immediately
   res.status(202).send({ message: `Accepted. Processing video: ${videoId}` });
 
+  const tempRawDir = path.join('/tmp', 'temp_raw');
+  const tempHlsDir = path.join('/tmp', 'temp_hls');
+  fs.mkdirSync(tempRawDir, { recursive: true });
+  fs.mkdirSync(tempHlsDir, { recursive: true });
+
+  const localRawPath = path.join(tempRawDir, videoId + '.mp4');
+  const localHlsPlaylistPath = path.join(tempHlsDir, 'playlist.m3u8');
+  const localThumbnailPath = path.join(tempHlsDir, 'thumbnail.png');
+  const thumbnailFileName = `${videoId}.png`;
+
   try {
-    // Get video info from Supabase
+    // Get video info
     const { data: videoData, error: dbError } = await supabaseAdmin
       .from('videos')
       .select('raw_path')
@@ -42,17 +51,6 @@ app.post('/transcode', async (req, res) => {
       .single();
 
     if (dbError || !videoData) throw new Error(`Video not found for ID: ${videoId}`);
-
-    // Temp directories in /tmp
-    const tempRawDir = path.join('/tmp', 'temp_raw');
-    const tempHlsDir = path.join('/tmp', 'temp_hls');
-    fs.mkdirSync(tempRawDir, { recursive: true });
-    fs.mkdirSync(tempHlsDir, { recursive: true });
-
-    const localRawPath = path.join(tempRawDir, videoData.raw_path);
-    const localHlsPlaylistPath = path.join(tempHlsDir, 'playlist.m3u8');
-    const localThumbnailPath = path.join(tempHlsDir, 'thumbnail.png');
-    const thumbnailFileName = `${videoId}.png`;
 
     // Download raw video
     const { data: fileData, error: downloadError } = await supabaseAdmin.storage
@@ -62,43 +60,59 @@ app.post('/transcode', async (req, res) => {
     if (downloadError) throw downloadError;
     fs.writeFileSync(localRawPath, Buffer.from(await fileData.arrayBuffer()));
 
-    // Generate thumbnail
-    await new Promise((resolve, reject) => {
-      ffmpeg(localRawPath)
-        .screenshots({
-          timestamps: ['00:00:02'],
-          filename: 'thumbnail.png',
-          folder: tempHlsDir,
-          size: '640x360'
-        })
-        .on('end', resolve)
-        .on('error', reject);
-    });
+    // Generate thumbnail safely
+    try {
+      await new Promise((resolve, reject) => {
+        ffmpeg(localRawPath)
+          .screenshots({
+            timestamps: ['00:00:02'],
+            filename: 'thumbnail.png',
+            folder: tempHlsDir,
+            size: '320x180' // smaller thumbnail for less memory
+          })
+          .on('end', resolve)
+          .on('error', (err) => {
+            console.warn('Thumbnail generation failed:', err.message);
+            resolve(); // continue even if thumbnail fails
+          });
+      });
+    } catch (err) {
+      console.warn('Thumbnail generation skipped due to error:', err.message);
+    }
 
-    // Transcode to HLS
-    // Transcode to HLS
-await new Promise((resolve, reject) => {
-  ffmpeg(localRawPath)
-    .outputOptions([
-      '-c:v h264',
-      '-hls_time 10',
-      '-hls_list_size 0',
-      '-f hls',
-      '-vf scale=640:-2'  // Reduce width to 640px, maintain aspect ratio
-    ])
-    .output(localHlsPlaylistPath)
-    .on('end', resolve)
-    .on('error', reject)
-    .run();
-});
+    // Transcode to HLS safely
+    try {
+      await new Promise((resolve, reject) => {
+        ffmpeg(localRawPath)
+          .outputOptions([
+            '-c:v h264',
+            '-hls_time 10',
+            '-hls_list_size 0',
+            '-f hls',
+            '-vf scale=640:-2' // reduce width for memory limits
+          ])
+          .output(localHlsPlaylistPath)
+          .on('end', resolve)
+          .on('error', (err) => {
+            console.error('HLS transcoding failed:', err.message);
+            reject(err);
+          })
+          .run();
+      });
+    } catch (err) {
+      throw new Error('HLS transcoding failed');
+    }
 
-
-    // Upload thumbnail
-    const thumbnailBuffer = fs.readFileSync(localThumbnailPath);
-    const { error: thumbUploadError } = await supabaseAdmin.storage
-      .from('thumbnails')
-      .upload(thumbnailFileName, thumbnailBuffer, { contentType: 'image/png' });
-    if (thumbUploadError) throw thumbUploadError;
+    // Upload thumbnail if exists
+    if (fs.existsSync(localThumbnailPath)) {
+      const thumbnailBuffer = fs.readFileSync(localThumbnailPath);
+      const { error: thumbUploadError } = await supabaseAdmin.storage
+        .from('thumbnails')
+        .upload(thumbnailFileName, thumbnailBuffer, { contentType: 'image/png' });
+      if (thumbUploadError) console.warn('Thumbnail upload failed:', thumbUploadError.message);
+    } else {
+      console.warn('Thumbnail not generated, skipping upload');
+    }
 
     // Upload HLS files
     const hlsFiles = fs.readdirSync(tempHlsDir);
@@ -110,26 +124,26 @@ await new Promise((resolve, reject) => {
           contentType: file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T',
           upsert: true
         });
-      if (uploadError) throw uploadError;
+      if (uploadError) console.warn(`HLS upload failed for ${file}:`, uploadError.message);
     }
 
     // Update DB
     await supabaseAdmin.from('videos').update({
       status: 'ready',
       hls_path: `${videoId}/playlist.m3u8`,
-      thumbnail_path: thumbnailFileName
+      thumbnail_path: fs.existsSync(localThumbnailPath) ? thumbnailFileName : null
     }).eq('id', videoId);
 
     console.log(`✅ Video ${videoId} ready!`);
 
   } catch (error) {
-    console.error(`❌ Failed video ${videoId}:`, error);
+    console.error(`❌ Failed video ${videoId}:`, error.message);
     await supabaseAdmin.from('videos').update({ status: 'failed' }).eq('id', videoId);
 
   } finally {
     // Cleanup
-    fs.rmSync('/tmp/temp_raw', { recursive: true, force: true });
-    fs.rmSync('/tmp/temp_hls', { recursive: true, force: true });
+    fs.rmSync(tempRawDir, { recursive: true, force: true });
+    fs.rmSync(tempHlsDir, { recursive: true, force: true });
     console.log('Cleanup complete.');
   }
 });
