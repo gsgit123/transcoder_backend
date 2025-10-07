@@ -76,14 +76,22 @@ app.post('/transcode', async (req, res) => {
     });
 
     // Transcode to HLS
-    await new Promise((resolve, reject) => {
-      ffmpeg(localRawPath)
-        .outputOptions(['-c:v h264', '-hls_time 10', '-hls_list_size 0', '-f hls'])
-        .output(localHlsPlaylistPath)
-        .on('end', resolve)
-        .on('error', reject)
-        .run();
-    });
+    // Transcode to HLS
+await new Promise((resolve, reject) => {
+  ffmpeg(localRawPath)
+    .outputOptions([
+      '-c:v h264',
+      '-hls_time 10',
+      '-hls_list_size 0',
+      '-f hls',
+      '-vf scale=640:-2'  // Reduce width to 640px, maintain aspect ratio
+    ])
+    .output(localHlsPlaylistPath)
+    .on('end', resolve)
+    .on('error', reject)
+    .run();
+});
+
 
     // Upload thumbnail
     const thumbnailBuffer = fs.readFileSync(localThumbnailPath);
