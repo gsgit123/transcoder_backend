@@ -148,5 +148,6 @@ app.post('/transcode', async (req, res) => {
 });
 
 app.listen(port, () => {
+  res.send(`Transcoding service running on port ${port}`);
   console.log(`Server is running on port ${port}`);
 });
