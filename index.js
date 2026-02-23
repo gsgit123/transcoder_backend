@@ -1,3 +1,4 @@
+require("dotenv").config({ path: ".env.local" });
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const ffmpeg = require('fluent-ffmpeg');
